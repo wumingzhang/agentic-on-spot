@@ -1,0 +1,55 @@
+# Copy to terraform.tfvars (git-ignored) and replace the example values.
+# Container names follow Coder's docker template convention
+# coder-<owner>-<workspace>; check with `docker ps --format '{{.Names}}'`
+# on the host. Never list the control server container (`coder`).
+
+name = "spot-handoff"
+
+# Tags every workspace host carries; both IAM and the Lambda require ALL of
+# them, with these exact values, before a command is sent.
+expected_tags = {
+  Role        = "example-workspace-host"
+  Environment = "example"
+}
+
+targets = [
+  {
+    # Hermes: the owner-confirmed oneshot recovery-note command, verbatim
+    # (see README, Configuration). The prompt is ONE argv word, the supplied
+    # lines joined with spaces: argv words cannot carry newlines. The binary
+    # is named by its absolute path inside the container. detached = true:
+    # the host starts it with `docker exec -d` and reports "launched" without
+    # waiting (in a live test the oneshot wrote its note but outlived the 60 s
+    # per_target_timeout, so the synchronous exec was killed with rc 124).
+    # --run-budget 45 is then Hermes's own bound; nothing on the host observes
+    # or ends the process.
+    name      = "hermes"
+    container = "coder-example-hermes"
+    user      = "coder"
+    detached  = true
+    argv      = ["/home/coder/.local/bin/hermes", "chat", "--oneshot", "--run-budget", "45", "-q", "AWS Spot interruption: this host is about to be terminated. Create a recovery note in /home/coder/.hermes/handoffs/spot-latest.md. Inspect persisted recent sessions and task records. Record: - active or incomplete task IDs and artifact paths; - last verified progress; - next actions; - uncertain external side effects that must be checked before retrying. Do not start implementation, deploy, send messages, or change task status. Do not claim other running agents have checkpointed unless verified. If time is short, save a partial note immediately."]
+  },
+  {
+    # yardr: mail the yardmaster as the workspace user. The message is the
+    # durable record of the notice; {placeholders} are filled per event.
+    # Synchronous (detached left at its default, false): the exit status of
+    # `yardr mail` is the evidence that the mail was accepted.
+    name      = "yardr"
+    container = "coder-example-yardr"
+    user      = "coder"
+    argv = [
+      "/home/coder/.local/bin/yardr", "--home", "/home/coder/.yardr", "--actor", "example-operator",
+      "mail", "yardmaster",
+      "Spot interruption warning: instance {instance_id} will be terminated at about {deadline} (notice {event_time}, event {event_id}). Put all tasks into handoff mode now: commit work, note state on the bead, and stop starting new work.",
+    ]
+  },
+]
+
+# Staged rollout: "lambda" = no SendCommand at all; "host" = SendCommand runs
+# the host script with --dry-run (checks docker + containers, execs nothing);
+# "off" = live.
+dry_run = "lambda"
+
+tags = {
+  Project = "spot-handoff"
+}

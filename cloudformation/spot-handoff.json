@@ -1,0 +1,377 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "EC2 Spot Instance Interruption Warning (terminate) -> EventBridge -> Lambda -> SSM Run Command -> docker exec in workspace containers. Notification only, not checkpointing. Console-deployable twin of the terraform/ module in this repository; the Lambda code is the zip built by scripts/package-lambda.py, uploaded to an S3 bucket in the stack's region.",
+  "Metadata": {
+    "Comment": [
+      "This template is JSON rather than YAML so the repository's stdlib-only test suite can parse it",
+      "(tests/test_cloudformation.py) and scripts/cfn_check.py can evaluate it offline; the 'why' of each",
+      "resource is in terraform/*.tf, whose behaviour this template mirrors resource for resource.",
+      "Fleet tags are fixed parameter slots (ExpectedTag1..4) because CloudFormation cannot loop over a",
+      "map: both the Lambda's EXPECTED_TAGS and the IAM ssm:resourceTag conditions are built from the",
+      "same slots, so the two checks cannot drift apart. The tag-conditioned statement is a JSON string",
+      "because an IAM condition key cannot be an intrinsic function in object form.",
+      "CloudFormation Rules cannot do arithmetic, so the timeout budget (PerTargetTimeout + InspectTimeout",
+      "+ 10 < ExecutionTimeout) is checked by scripts/cfn_check.py before deployment and by the Lambda at",
+      "runtime (config.py), which then refuses every event rather than running with an unfit budget."
+    ],
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {"Label": {"default": "Lambda code artifact (scripts/package-lambda.py, uploaded to your bucket in this region)"},
+         "Parameters": ["LambdaCodeS3Bucket", "LambdaCodeS3Key", "LambdaCodeS3ObjectVersion"]},
+        {"Label": {"default": "What to notify"},
+         "Parameters": ["Name", "Targets", "ForbiddenContainers", "StateDir"]},
+        {"Label": {"default": "Fleet tags: every one must match on the instance (Lambda check and IAM condition)"},
+         "Parameters": ["ExpectedTag1Key", "ExpectedTag1Value", "ExpectedTag2Key", "ExpectedTag2Value",
+                        "ExpectedTag3Key", "ExpectedTag3Value", "ExpectedTag4Key", "ExpectedTag4Value"]},
+        {"Label": {"default": "Rollout"}, "Parameters": ["DryRun"]},
+        {"Label": {"default": "Host script timeouts (seconds)"},
+         "Parameters": ["ExecutionTimeout", "SubmissionTimeout", "PerTargetTimeout", "InspectTimeout"]},
+        {"Label": {"default": "Lambda"},
+         "Parameters": ["LambdaRuntime", "LambdaArchitecture", "LambdaTimeout", "LambdaMemorySize"]},
+        {"Label": {"default": "Retention, TTL and retries"},
+         "Parameters": ["LogRetentionDays", "MaxEventAgeSeconds", "MaxRetryAttempts", "EventBusName"]}
+      ],
+      "ParameterLabels": {
+        "LambdaCodeS3Bucket": {"default": "S3 bucket holding the Lambda zip"},
+        "LambdaCodeS3Key": {"default": "S3 key of the Lambda zip"},
+        "LambdaCodeS3ObjectVersion": {"default": "S3 object version of the zip (optional)"},
+        "Targets": {"default": "Targets (JSON list, one line)"},
+        "DryRun": {"default": "Dry-run mode"}
+      }
+    }
+  },
+  "Parameters": {
+    "Name": {
+      "Type": "String",
+      "Default": "spot-handoff",
+      "AllowedPattern": "^[A-Za-z0-9_-]{1,48}$",
+      "ConstraintDescription": "1-48 characters of [A-Za-z0-9_-]",
+      "Description": "Name of the Lambda function, log group (/aws/lambda/<Name>) and EventBridge rule. The IAM role is named by CloudFormation so only CAPABILITY_IAM is needed."
+    },
+    "LambdaCodeS3Bucket": {
+      "Type": "String",
+      "AllowedPattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
+      "ConstraintDescription": "an S3 bucket name",
+      "Description": "Bucket you own, in the same region as this stack (Lambda requires it), holding the zip built by scripts/package-lambda.py."
+    },
+    "LambdaCodeS3Key": {
+      "Type": "String",
+      "Default": "spot-handoff-lambda.zip",
+      "MinLength": 1,
+      "MaxLength": 1024,
+      "Description": "Key of the zip in that bucket. CloudFormation redeploys the code only when this key or LambdaCodeS3ObjectVersion changes, not when the object is overwritten in place."
+    },
+    "LambdaCodeS3ObjectVersion": {
+      "Type": "String",
+      "Default": "",
+      "MaxLength": 1024,
+      "Description": "Version id of the object when the bucket has versioning, to pin exactly the reviewed artifact. Leave empty for the current object."
+    },
+    "Targets": {
+      "Type": "String",
+      "MinLength": 2,
+      "MaxLength": 4000,
+      "Description": "JSON list of containers to notify, on one line, same shape as the Terraform `targets` variable: [{\"name\":\"hermes\",\"container\":\"coder-OWNER-WORKSPACE\",\"user\":\"coder\",\"detached\":true,\"argv\":[\"/home/coder/.local/bin/hermes\",\"chat\",\"--oneshot\",\"--run-budget\",\"45\",\"-q\",\"<one single-line prompt>\"]},{\"name\":\"yardr\",\"container\":\"coder-OWNER-WORKSPACE\",\"user\":\"coder\",\"argv\":[...]}]. argv words may use {instance_id}, {event_id}, {event_time}, {deadline}. detached (optional JSON boolean, default false) starts that target with `docker exec -d` and reports it as launched instead of waiting for it. Validated by the Lambda (config.py) and offline by scripts/cfn_check.py; CloudFormation itself cannot check its content."
+    },
+    "ForbiddenContainers": {
+      "Type": "String",
+      "Default": "coder",
+      "MaxLength": 1024,
+      "AllowedPattern": "^[A-Za-z0-9_., -]*$",
+      "Description": "Comma-separated container names the Lambda refuses to target whatever Targets says. `coder` is the Coder control server; empty disables the guard."
+    },
+    "StateDir": {
+      "Type": "String",
+      "Default": "/data/spot-handoff",
+      "AllowedPattern": "^/[A-Za-z0-9_./-]{1,200}$",
+      "ConstraintDescription": "an absolute path of [A-Za-z0-9_./-]",
+      "Description": "Host directory for per-event dedup markers; put it on the persistent volume (/data) so a redelivery minutes later is still recognised."
+    },
+    "ExpectedTag1Key": {
+      "Type": "String",
+      "MinLength": 1,
+      "MaxLength": 128,
+      "AllowedPattern": "^[A-Za-z0-9_ .:/=+@-]{1,128}$",
+      "ConstraintDescription": "a tag key of [A-Za-z0-9_ .:/=+@-]",
+      "Description": "Required. Tag key every workspace host carries (for example Role)."
+    },
+    "ExpectedTag1Value": {
+      "Type": "String",
+      "MaxLength": 256,
+      "AllowedPattern": "^[A-Za-z0-9_ .:/=+@-]{0,256}$",
+      "ConstraintDescription": "a tag value of [A-Za-z0-9_ .:/=+@-]",
+      "Description": "Required. Exact value of that tag."
+    },
+    "ExpectedTag2Key": {"Type": "String", "Default": "", "MaxLength": 128, "AllowedPattern": "^([A-Za-z0-9_ .:/=+@-]{1,128})?$", "ConstraintDescription": "empty or a tag key of [A-Za-z0-9_ .:/=+@-]", "Description": "Optional second tag key."},
+    "ExpectedTag2Value": {"Type": "String", "Default": "", "MaxLength": 256, "AllowedPattern": "^[A-Za-z0-9_ .:/=+@-]{0,256}$", "ConstraintDescription": "a tag value of [A-Za-z0-9_ .:/=+@-]", "Description": "Exact value of the second tag."},
+    "ExpectedTag3Key": {"Type": "String", "Default": "", "MaxLength": 128, "AllowedPattern": "^([A-Za-z0-9_ .:/=+@-]{1,128})?$", "ConstraintDescription": "empty or a tag key of [A-Za-z0-9_ .:/=+@-]", "Description": "Optional third tag key."},
+    "ExpectedTag3Value": {"Type": "String", "Default": "", "MaxLength": 256, "AllowedPattern": "^[A-Za-z0-9_ .:/=+@-]{0,256}$", "ConstraintDescription": "a tag value of [A-Za-z0-9_ .:/=+@-]", "Description": "Exact value of the third tag."},
+    "ExpectedTag4Key": {"Type": "String", "Default": "", "MaxLength": 128, "AllowedPattern": "^([A-Za-z0-9_ .:/=+@-]{1,128})?$", "ConstraintDescription": "empty or a tag key of [A-Za-z0-9_ .:/=+@-]", "Description": "Optional fourth tag key. More than four: use the Terraform module or extend the slots in this template."},
+    "ExpectedTag4Value": {"Type": "String", "Default": "", "MaxLength": 256, "AllowedPattern": "^[A-Za-z0-9_ .:/=+@-]{0,256}$", "ConstraintDescription": "a tag value of [A-Za-z0-9_ .:/=+@-]", "Description": "Exact value of the fourth tag."},
+    "DryRun": {
+      "Type": "String",
+      "Default": "lambda",
+      "AllowedValues": ["lambda", "host", "off"],
+      "Description": "lambda (default): validate, check tags and log, never call SendCommand. host: SendCommand runs the host script with --dry-run (checks docker and the containers, execs nothing). off: live."
+    },
+    "ExecutionTimeout": {
+      "Type": "Number", "Default": 90, "MinValue": 13, "MaxValue": 172800,
+      "Description": "SSM AWS-RunShellScript executionTimeout for the whole host script. Must exceed PerTargetTimeout + InspectTimeout + 10 (two 5 s kill graces); CloudFormation cannot check this sum, scripts/cfn_check.py and the Lambda do."
+    },
+    "SubmissionTimeout": {
+      "Type": "Number", "Default": 30, "MinValue": 30, "MaxValue": 2592000,
+      "Description": "SSM SendCommand TimeoutSeconds: if the agent has not started the command by then it never runs. SSM's minimum is 30."
+    },
+    "PerTargetTimeout": {
+      "Type": "Number", "Default": 60, "MinValue": 1, "MaxValue": 9999,
+      "Description": "Seconds each docker exec may take before it is killed. Targets run in parallel."
+    },
+    "InspectTimeout": {
+      "Type": "Number", "Default": 10, "MinValue": 1, "MaxValue": 9999,
+      "Description": "Seconds allowed for docker inspect before the daemon is declared unavailable."
+    },
+    "LambdaRuntime": {
+      "Type": "String", "Default": "python3.12", "AllowedValues": ["python3.12", "python3.13", "python3.14"],
+      "Description": "The code is stdlib + boto3 and needs nothing newer than 3.12."
+    },
+    "LambdaArchitecture": {"Type": "String", "Default": "arm64", "AllowedValues": ["arm64", "x86_64"]},
+    "LambdaTimeout": {
+      "Type": "Number", "Default": 60, "MinValue": 1, "MaxValue": 900,
+      "Description": "Two SDK calls with 3 s connect / 10 s read timeouts and two attempts each fit well inside 60 s."
+    },
+    "LambdaMemorySize": {"Type": "Number", "Default": 128, "MinValue": 128, "MaxValue": 10240},
+    "LogRetentionDays": {
+      "Type": "Number", "Default": 30,
+      "AllowedValues": [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653],
+      "Description": "CloudWatch Logs retention of the Lambda log group."
+    },
+    "MaxEventAgeSeconds": {
+      "Type": "Number", "Default": 180, "MinValue": 60, "MaxValue": 21600,
+      "Description": "TTL of a notice from its own time: EventBridge delivery retries, Lambda asynchronous retries and the Lambda's own staleness check all stop here. A notice is useless after the two-minute window, so keep it short."
+    },
+    "MaxRetryAttempts": {
+      "Type": "Number", "Default": 2, "MinValue": 0, "MaxValue": 2,
+      "Description": "Lambda asynchronous retries after a raised error (API failure, timeout). Validation failures and tag mismatches return normally and are never retried."
+    },
+    "EventBusName": {
+      "Type": "String", "Default": "default", "MinLength": 1, "MaxLength": 256,
+      "Description": "EventBridge bus receiving the EC2 events; AWS service events arrive on `default`."
+    }
+  },
+  "Rules": {
+    "ExpectedTag2ValueNeedsKey": {
+      "RuleCondition": {"Fn::Equals": [{"Ref": "ExpectedTag2Key"}, ""]},
+      "Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "ExpectedTag2Value"}, ""]}, "AssertDescription": "ExpectedTag2Value is set but ExpectedTag2Key is empty."}]
+    },
+    "ExpectedTag3ValueNeedsKey": {
+      "RuleCondition": {"Fn::Equals": [{"Ref": "ExpectedTag3Key"}, ""]},
+      "Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "ExpectedTag3Value"}, ""]}, "AssertDescription": "ExpectedTag3Value is set but ExpectedTag3Key is empty."}]
+    },
+    "ExpectedTag4ValueNeedsKey": {
+      "RuleCondition": {"Fn::Equals": [{"Ref": "ExpectedTag4Key"}, ""]},
+      "Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "ExpectedTag4Value"}, ""]}, "AssertDescription": "ExpectedTag4Value is set but ExpectedTag4Key is empty."}]
+    },
+    "ExpectedTagKeysDistinct12": {
+      "RuleCondition": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag2Key"}, ""]}]},
+      "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag1Key"}, {"Ref": "ExpectedTag2Key"}]}]}, "AssertDescription": "ExpectedTag1Key and ExpectedTag2Key are the same key."}]
+    },
+    "ExpectedTagKeysDistinct13": {
+      "RuleCondition": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag3Key"}, ""]}]},
+      "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag1Key"}, {"Ref": "ExpectedTag3Key"}]}]}, "AssertDescription": "ExpectedTag1Key and ExpectedTag3Key are the same key."}]
+    },
+    "ExpectedTagKeysDistinct14": {
+      "RuleCondition": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag4Key"}, ""]}]},
+      "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag1Key"}, {"Ref": "ExpectedTag4Key"}]}]}, "AssertDescription": "ExpectedTag1Key and ExpectedTag4Key are the same key."}]
+    },
+    "ExpectedTagKeysDistinct23": {
+      "RuleCondition": {"Fn::And": [{"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag2Key"}, ""]}]}, {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag3Key"}, ""]}]}]},
+      "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag2Key"}, {"Ref": "ExpectedTag3Key"}]}]}, "AssertDescription": "ExpectedTag2Key and ExpectedTag3Key are the same key."}]
+    },
+    "ExpectedTagKeysDistinct24": {
+      "RuleCondition": {"Fn::And": [{"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag2Key"}, ""]}]}, {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag4Key"}, ""]}]}]},
+      "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag2Key"}, {"Ref": "ExpectedTag4Key"}]}]}, "AssertDescription": "ExpectedTag2Key and ExpectedTag4Key are the same key."}]
+    },
+    "ExpectedTagKeysDistinct34": {
+      "RuleCondition": {"Fn::And": [{"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag3Key"}, ""]}]}, {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag4Key"}, ""]}]}]},
+      "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag3Key"}, {"Ref": "ExpectedTag4Key"}]}]}, "AssertDescription": "ExpectedTag3Key and ExpectedTag4Key are the same key."}]
+    }
+  },
+  "Conditions": {
+    "HasExpectedTag2": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag2Key"}, ""]}]},
+    "HasExpectedTag3": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag3Key"}, ""]}]},
+    "HasExpectedTag4": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ExpectedTag4Key"}, ""]}]},
+    "HasCodeObjectVersion": {"Fn::Not": [{"Fn::Equals": [{"Ref": "LambdaCodeS3ObjectVersion"}, ""]}]}
+  },
+  "Resources": {
+    "LogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Metadata": {"Comment": "Created here with explicit retention, so the role needs no logs:CreateLogGroup."},
+      "Properties": {
+        "LogGroupName": {"Fn::Sub": "/aws/lambda/${Name}"},
+        "RetentionInDays": {"Ref": "LogRetentionDays"}
+      }
+    },
+    "LambdaRole": {
+      "Type": "AWS::IAM::Role",
+      "Metadata": {"Comment": [
+        "Mirror of terraform/iam.tf. Two inline policies instead of one because the tag-conditioned",
+        "statement needs dynamic condition keys (ssm:resourceTag/<ExpectedTagNKey>), which object-form",
+        "JSON cannot express; it is therefore assembled as a string. ssm:SendCommand needs two allow",
+        "statements: the AWS-owned AWS-RunShellScript document (no account in its ARN) and the tagged",
+        "instances of this account and region. ec2:DescribeInstances has no resource-level permissions."
+      ]},
+      "Properties": {
+        "Description": {"Fn::Sub": "${Name}: EventBridge-invoked Lambda that sends AWS-RunShellScript to tagged Spot instances"},
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "LambdaAssumeRole",
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:SourceAccount": {"Ref": "AWS::AccountId"}}}
+          }]
+        },
+        "Policies": [
+          {
+            "PolicyName": {"Fn::Sub": "${Name}-least-privilege"},
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "WriteOwnLogGroup",
+                  "Effect": "Allow",
+                  "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  "Resource": {"Fn::GetAtt": ["LogGroup", "Arn"]}
+                },
+                {
+                  "Sid": "DescribeInstancesForTagCheck",
+                  "Effect": "Allow",
+                  "Action": "ec2:DescribeInstances",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "SendRunShellScriptDocument",
+                  "Effect": "Allow",
+                  "Action": "ssm:SendCommand",
+                  "Resource": {"Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"}
+                }
+              ]
+            }
+          },
+          {
+            "PolicyName": {"Fn::Sub": "${Name}-tagged-instances"},
+            "PolicyDocument": {"Fn::Join": ["", [
+              "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"SendCommandToTaggedInstances\",\"Effect\":\"Allow\",\"Action\":\"ssm:SendCommand\",",
+              {"Fn::Sub": "\"Resource\":\"arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*\","},
+              "\"Condition\":{\"StringEquals\":{",
+              {"Fn::Sub": "\"ssm:resourceTag/${ExpectedTag1Key}\":\"${ExpectedTag1Value}\""},
+              {"Fn::If": ["HasExpectedTag2", {"Fn::Sub": ",\"ssm:resourceTag/${ExpectedTag2Key}\":\"${ExpectedTag2Value}\""}, ""]},
+              {"Fn::If": ["HasExpectedTag3", {"Fn::Sub": ",\"ssm:resourceTag/${ExpectedTag3Key}\":\"${ExpectedTag3Value}\""}, ""]},
+              {"Fn::If": ["HasExpectedTag4", {"Fn::Sub": ",\"ssm:resourceTag/${ExpectedTag4Key}\":\"${ExpectedTag4Value}\""}, ""]},
+              "}}}]}"
+            ]]}
+          }
+        ]
+      }
+    },
+    "LambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Metadata": {"Comment": "Same handler, environment and logging as terraform/main.tf; the code is the zip in your bucket."},
+      "Properties": {
+        "FunctionName": {"Ref": "Name"},
+        "Description": "Notifies workspace containers on a Spot instance that it is about to be interrupted (notification, not checkpointing).",
+        "Role": {"Fn::GetAtt": ["LambdaRole", "Arn"]},
+        "Code": {
+          "S3Bucket": {"Ref": "LambdaCodeS3Bucket"},
+          "S3Key": {"Ref": "LambdaCodeS3Key"},
+          "S3ObjectVersion": {"Fn::If": ["HasCodeObjectVersion", {"Ref": "LambdaCodeS3ObjectVersion"}, {"Ref": "AWS::NoValue"}]}
+        },
+        "Handler": "spot_handoff.handler.lambda_handler",
+        "Runtime": {"Ref": "LambdaRuntime"},
+        "Architectures": [{"Ref": "LambdaArchitecture"}],
+        "Timeout": {"Ref": "LambdaTimeout"},
+        "MemorySize": {"Ref": "LambdaMemorySize"},
+        "Environment": {
+          "Variables": {
+            "TARGETS": {"Ref": "Targets"},
+            "EXPECTED_TAGS": {"Fn::Join": ["", [
+              "{",
+              {"Fn::Sub": "\"${ExpectedTag1Key}\":\"${ExpectedTag1Value}\""},
+              {"Fn::If": ["HasExpectedTag2", {"Fn::Sub": ",\"${ExpectedTag2Key}\":\"${ExpectedTag2Value}\""}, ""]},
+              {"Fn::If": ["HasExpectedTag3", {"Fn::Sub": ",\"${ExpectedTag3Key}\":\"${ExpectedTag3Value}\""}, ""]},
+              {"Fn::If": ["HasExpectedTag4", {"Fn::Sub": ",\"${ExpectedTag4Key}\":\"${ExpectedTag4Value}\""}, ""]},
+              "}"
+            ]]},
+            "FORBIDDEN_CONTAINERS": {"Ref": "ForbiddenContainers"},
+            "STATE_DIR": {"Ref": "StateDir"},
+            "EXECUTION_TIMEOUT": {"Ref": "ExecutionTimeout"},
+            "SUBMISSION_TIMEOUT": {"Ref": "SubmissionTimeout"},
+            "PER_TARGET_TIMEOUT": {"Ref": "PerTargetTimeout"},
+            "INSPECT_TIMEOUT": {"Ref": "InspectTimeout"},
+            "DRY_RUN": {"Ref": "DryRun"},
+            "MAX_EVENT_AGE": {"Ref": "MaxEventAgeSeconds"},
+            "EXPECTED_ACCOUNT_ID": {"Ref": "AWS::AccountId"}
+          }
+        },
+        "LoggingConfig": {"LogFormat": "Text", "LogGroup": {"Ref": "LogGroup"}}
+      }
+    },
+    "LambdaEventInvokeConfig": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Metadata": {"Comment": "A notice is worthless minutes later: cap how long failed asynchronous invocations retry."},
+      "Properties": {
+        "FunctionName": {"Ref": "LambdaFunction"},
+        "Qualifier": "$LATEST",
+        "MaximumEventAgeInSeconds": {"Ref": "MaxEventAgeSeconds"},
+        "MaximumRetryAttempts": {"Ref": "MaxRetryAttempts"}
+      }
+    },
+    "SpotInterruptionRule": {
+      "Type": "AWS::Events::Rule",
+      "Metadata": {"Comment": "terminate only; stop and hibernate are ignored on purpose, and the Lambda re-checks all three fields."},
+      "Properties": {
+        "Name": {"Ref": "Name"},
+        "Description": {"Fn::Sub": "EC2 Spot Instance Interruption Warning (terminate) -> ${Name}"},
+        "EventBusName": {"Ref": "EventBusName"},
+        "State": "ENABLED",
+        "EventPattern": {
+          "source": ["aws.ec2"],
+          "detail-type": ["EC2 Spot Instance Interruption Warning"],
+          "detail": {"instance-action": ["terminate"]}
+        },
+        "Targets": [{
+          "Id": "lambda",
+          "Arn": {"Fn::GetAtt": ["LambdaFunction", "Arn"]},
+          "RetryPolicy": {"MaximumEventAgeInSeconds": {"Ref": "MaxEventAgeSeconds"}, "MaximumRetryAttempts": 3}
+        }]
+      }
+    },
+    "EventBridgeInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Metadata": {"Comment": "Scoped to this rule's ARN: no other rule or principal may invoke the function."},
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "LambdaFunction"},
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {"Fn::GetAtt": ["SpotInterruptionRule", "Arn"]}
+      }
+    }
+  },
+  "Outputs": {
+    "LambdaFunctionName": {
+      "Description": "Use with `aws lambda invoke` and `aws logs tail`.",
+      "Value": {"Ref": "LambdaFunction"}
+    },
+    "LambdaFunctionArn": {"Value": {"Fn::GetAtt": ["LambdaFunction", "Arn"]}},
+    "LambdaRoleArn": {
+      "Description": "Review the rendered policies with `aws iam list-role-policies` / `get-role-policy` on this role.",
+      "Value": {"Fn::GetAtt": ["LambdaRole", "Arn"]}
+    },
+    "EventRuleArn": {
+      "Description": "The Lambda invoke permission is scoped to this ARN.",
+      "Value": {"Fn::GetAtt": ["SpotInterruptionRule", "Arn"]}
+    },
+    "LogGroupName": {"Value": {"Ref": "LogGroup"}}
+  }
+}

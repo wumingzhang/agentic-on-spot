@@ -1,0 +1,23 @@
+[
+  {"ParameterKey": "Name", "ParameterValue": "spot-handoff"},
+  {"ParameterKey": "LambdaCodeS3Bucket", "ParameterValue": "example-deployment-bucket"},
+  {"ParameterKey": "LambdaCodeS3Key", "ParameterValue": "spot-handoff/spot-handoff-lambda.zip"},
+  {"ParameterKey": "LambdaCodeS3ObjectVersion", "ParameterValue": ""},
+  {"ParameterKey": "Targets", "ParameterValue": "[{\"name\":\"hermes\",\"container\":\"coder-example-hermes\",\"user\":\"coder\",\"detached\":true,\"argv\":[\"/home/coder/.local/bin/hermes\",\"chat\",\"--oneshot\",\"--run-budget\",\"45\",\"-q\",\"AWS Spot interruption: this host is about to be terminated. Create a recovery note in /home/coder/.hermes/handoffs/spot-latest.md. Inspect persisted recent sessions and task records. Record: - active or incomplete task IDs and artifact paths; - last verified progress; - next actions; - uncertain external side effects that must be checked before retrying. Do not start implementation, deploy, send messages, or change task status. Do not claim other running agents have checkpointed unless verified. If time is short, save a partial note immediately.\"]},{\"name\":\"yardr\",\"container\":\"coder-example-yardr\",\"user\":\"coder\",\"argv\":[\"/home/coder/.local/bin/yardr\",\"--home\",\"/home/coder/.yardr\",\"--actor\",\"example-operator\",\"mail\",\"yardmaster\",\"Spot interruption warning: instance {instance_id} will be terminated at about {deadline} (notice {event_time}, event {event_id}). Put all tasks into handoff mode now: commit work, note state on the bead, and stop starting new work.\"]}]"},
+  {"ParameterKey": "ForbiddenContainers", "ParameterValue": "coder"},
+  {"ParameterKey": "StateDir", "ParameterValue": "/data/spot-handoff"},
+  {"ParameterKey": "ExpectedTag1Key", "ParameterValue": "Role"},
+  {"ParameterKey": "ExpectedTag1Value", "ParameterValue": "example-workspace-host"},
+  {"ParameterKey": "ExpectedTag2Key", "ParameterValue": "Environment"},
+  {"ParameterKey": "ExpectedTag2Value", "ParameterValue": "example"},
+  {"ParameterKey": "DryRun", "ParameterValue": "lambda"},
+  {"ParameterKey": "ExecutionTimeout", "ParameterValue": "90"},
+  {"ParameterKey": "SubmissionTimeout", "ParameterValue": "30"},
+  {"ParameterKey": "PerTargetTimeout", "ParameterValue": "60"},
+  {"ParameterKey": "InspectTimeout", "ParameterValue": "10"},
+  {"ParameterKey": "LambdaRuntime", "ParameterValue": "python3.12"},
+  {"ParameterKey": "LambdaArchitecture", "ParameterValue": "arm64"},
+  {"ParameterKey": "LogRetentionDays", "ParameterValue": "30"},
+  {"ParameterKey": "MaxEventAgeSeconds", "ParameterValue": "180"},
+  {"ParameterKey": "MaxRetryAttempts", "ParameterValue": "2"}
+]

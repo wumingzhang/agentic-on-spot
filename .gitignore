@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.terraform/
+.terraform.lock.hcl
+terraform/.build/
+build/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+.env
+*.zip
+# Local deployment inputs and outputs. The *.example.* files stay tracked; a
+# real parameter file, an edited event and the output of `aws lambda invoke`
+# carry your account, instance and container names.
+my-*.json
+out.json
